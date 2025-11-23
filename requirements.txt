@@ -4,6 +4,5 @@ requests
 Pillow
 numpy
 opencv-python-headless
-insightface
-onnxruntime
-gunicorn
+dlib
+face_recognition
