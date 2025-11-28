@@ -3,7 +3,7 @@ import os
 import base64
 import requests
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
@@ -11,17 +11,19 @@ from flask_cors import CORS
 from PIL import Image
 import numpy as np
 import cv2
+import msal
 
 # InsightFace
 import insightface
 from insightface.app import FaceAnalysis
 
+
 # ---------------- CONFIG ----------------
 TRAIN_DIR = "Training_images"
 LOG_FILE = "Log_Data.csv"
 
-INSIGHT_MODEL = "buffalo_l"   # or "antelope"
-COSINE_THRESHOLD = 0.50       # tune as needed
+INSIGHT_MODEL = "buffalo_l"
+COSINE_THRESHOLD = 0.50
 
 os.makedirs(TRAIN_DIR, exist_ok=True)
 if not os.path.exists(LOG_FILE):
@@ -31,13 +33,73 @@ if not os.path.exists(LOG_FILE):
 app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
+# ---------------- EMAIL CONFIG (MICROSOFT GRAPH) ----------------
+IST = timezone(timedelta(hours=5, minutes=30))
+
+CLIENT_ID     = os.getenv("CLIENT_ID", "377ae826-cdfd-41ab-bfa5-8b510aa5e668")
+TENANT_ID     = os.getenv("TENANT_ID", "11f40179-cc91-4f79-bc13-d468ae3c3faf")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "Mff8Q~Jvf_m~FxmSojsoCd6Ef6QLoRYsb8h3TbwJ")
+HR_UPN        = os.getenv("HR_UPN", "hr@algorithmicaconsulting.com")
+
+
+def get_graph_token():
+    app_msal = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        client_credential=CLIENT_SECRET,
+    )
+
+    token = app_msal.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
+
+    if "access_token" not in token:
+        raise RuntimeError(f"Token error: {token}")
+
+    return token["access_token"]
+
+
+def send_email(to_email, subject, html_body):
+    try:
+        token = get_graph_token()
+
+        msg = {
+            "message": {
+                "subject": subject,
+                "body": {
+                    "contentType": "HTML",
+                    "content": html_body
+                },
+                "toRecipients": [
+                    {"emailAddress": {"address": to_email}}
+                ],
+            },
+            "saveToSentItems": True,
+        }
+
+        requests.post(
+            f"https://graph.microsoft.com/v1.0/users/{HR_UPN}/sendMail",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json=msg,
+            timeout=20
+        ).raise_for_status()
+
+        print(f"[EMAIL SENT ✅] {to_email}")
+
+    except Exception as e:
+        print(f"[EMAIL ERROR ❌] {e}")
+
+
 # ---------------- InsightFace Initialization ----------------
 try:
     insight_app = FaceAnalysis(name=INSIGHT_MODEL)
     try:
-        insight_app.prepare(ctx_id=0, det_size=(640, 640))  # try GPU
+        insight_app.prepare(ctx_id=0, det_size=(640, 640))  # GPU
     except:
-        insight_app.prepare(ctx_id=-1, det_size=(640, 640)) # CPU
+        insight_app.prepare(ctx_id=-1, det_size=(640, 640))  # CPU
     print("InsightFace loaded successfully.")
 except Exception as e:
     insight_app = None
@@ -61,7 +123,6 @@ def pil_to_bgr_np(pil_img):
 
 
 def get_first_normed_embedding_from_pil(pil_img):
-    """Extract ArcFace embedding safely — NO boolean check on arrays."""
     if insight_app is None:
         raise RuntimeError("InsightFace not initialized")
 
@@ -71,7 +132,6 @@ def get_first_normed_embedding_from_pil(pil_img):
     if not faces:
         return None
 
-    # pick largest face
     faces_sorted = sorted(
         faces,
         key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
@@ -79,7 +139,6 @@ def get_first_normed_embedding_from_pil(pil_img):
     )
     face = faces_sorted[0]
 
-    # SAFE: do NOT use "or" on NumPy arrays
     emb = getattr(face, "normed_embedding", None)
     if emb is None:
         emb = getattr(face, "embedding", None)
@@ -88,8 +147,6 @@ def get_first_normed_embedding_from_pil(pil_img):
         return None
 
     emb = np.asarray(emb, dtype=np.float32)
-
-    # ensure l2 normalization
     norm = np.linalg.norm(emb)
     if norm > 0:
         emb = emb / norm
@@ -115,6 +172,7 @@ def index():
     return render_template("index.html")
 
 
+# ---------------- FACE MATCH + ATTENDANCE ----------------
 @app.route("/process_image", methods=["POST"])
 def process_image():
     try:
@@ -128,59 +186,40 @@ def process_image():
         if not captured_data:
             return jsonify({"status": "error", "error": "No captured_image provided"})
 
-        # ---------------- PROCESS CAPTURED IMAGE ----------------
-        try:
-            captured_pil = b64_to_pil_image(captured_data)
-        except Exception as e:
-            return jsonify({"status": "error", "error": f"Invalid captured_image: {e}"})
-
+        # --- Captured Image ---
+        captured_pil = b64_to_pil_image(captured_data)
         captured_emb = get_first_normed_embedding_from_pil(captured_pil)
         if captured_emb is None:
             return jsonify({"status": "unknown", "error": "No face found in captured image"})
 
-        # ---------------- PROCESS REFERENCE IMAGE ----------------
-        if not reference:
-            return jsonify({"status": "error", "error": "No reference_image provided"})
-
-        # If URL, download
+        # --- Reference Image ---
         if reference.startswith("http"):
-            try:
-                resp = requests.get(reference, timeout=10)
-                resp.raise_for_status()
-                ref_pil = Image.open(BytesIO(resp.content)).convert("RGB")
-            except Exception as e:
-                return jsonify({"status": "error", "error": f"Could not download reference image: {e}"})
+            resp = requests.get(reference, timeout=10)
+            resp.raise_for_status()
+            ref_pil = Image.open(BytesIO(resp.content)).convert("RGB")
         else:
-            try:
-                ref_pil = b64_to_pil_image(reference)
-            except Exception as e:
-                return jsonify({"status": "error", "error": f"Invalid reference_image: {e}"})
+            ref_pil = b64_to_pil_image(reference)
 
         ref_emb = get_first_normed_embedding_from_pil(ref_pil)
         if ref_emb is None:
             return jsonify({"status": "error", "error": "No face found in reference image"})
 
-        # ---------------- COMPARE USING COSINE SIMILARITY ----------------
+        # --- Compare ---
         similarity = cosine_similarity(ref_emb, captured_emb)
 
         if similarity >= COSINE_THRESHOLD:
-            # Match found
             name = data.get("name") or f"USER_{user_id or emp_id}"
-
             log_attendance_local(name)
 
-            # Convert reference image back to base64
             buf = BytesIO()
             ref_pil.save(buf, format="JPEG", quality=90)
             b64img = base64.b64encode(buf.getvalue()).decode("utf-8")
             matched_datauri = f"data:image/jpeg;base64,{b64img}"
 
-            # ---------------- CALL ATTENDANCE API ----------------
             attendance_response = None
             if emp_id:
                 try:
                     attendance_url = f"https://acsdev.in/fynryx_backend/api/qr/attendance/{emp_id}"
-
                     now = datetime.now()
                     payload = {
                         "user_id": str(user_id or emp_id),
@@ -190,12 +229,10 @@ def process_image():
                         "status": "present",
                         "create_audit_id": "1",
                     }
-
-                    headers = {"Content-Type": "application/json"}
-                    res = requests.post(attendance_url, json=payload, headers=headers, timeout=10)
+                    res = requests.post(attendance_url, json=payload, timeout=10)
                     attendance_response = res.json()
                 except Exception as e:
-                    attendance_response = {"error": f"API call failed: {e}"}
+                    attendance_response = {"error": str(e)}
 
             return jsonify({
                 "status": "success",
@@ -205,15 +242,54 @@ def process_image():
                 "attendance_response": attendance_response,
             })
 
-        else:
-            return jsonify({
-                "status": "unknown",
-                "similarity": similarity,
-                "message": "Face did not match reference."
-            })
+        return jsonify({
+            "status": "unknown",
+            "similarity": similarity,
+            "message": "Face did not match reference."
+        })
 
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)})
+
+
+# ---------------- EMAIL API (FIXED 404 ISSUE) ----------------
+@app.route("/api/send_attendance_email", methods=["POST", "OPTIONS"])
+def api_send_attendance_email():
+    if request.method == "OPTIONS":
+        return ("", 200)
+
+    data = request.get_json(force=True) or {}
+    to_email = data.get("email")
+    name = data.get("name", "Employee")
+
+    if not to_email:
+        return jsonify({"status": "error", "message": "email required"}), 400
+
+    ts = datetime.now(IST).strftime("%d %b %Y, %I:%M %p")
+    subject = f"Attendance Marked - {ts}"
+
+    html_body = f"""
+    <html>
+      <body style="font-family: system-ui; background:#f3f4f6; padding:24px;">
+        <div style="max-width:480px; margin:0 auto;">
+          <div style="background:linear-gradient(135deg,#2563eb,#7c3aed); padding:2px; border-radius:16px;">
+            <div style="background:#ffffff; border-radius:14px; padding:24px;">
+              <h2>Attendance Marked ✅</h2>
+              <p>Hello <b>{name}</b>, your attendance was marked successfully.</p>
+              <div style="background:#f9fafb; padding:16px; border-radius:12px;">
+                <p><b>Time:</b> {ts} (IST)</p>
+              </div>
+              <p style="color:#6b7280; font-size:12px;">Automated Attendance System</p>
+            </div>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+
+    send_email(to_email, subject, html_body)
+
+    return jsonify({"status": "success", "message": "Email sent"}), 200
 
 
 # ---------------- BOOT ----------------
