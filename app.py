@@ -1,4 +1,6 @@
-# app.py
+# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+
 import os
 import base64
 import requests
@@ -93,6 +95,67 @@ def send_email(to_email, subject, html_body):
         print(f"[EMAIL ERROR ❌] {e}")
 
 
+# ---------------- EXTRA HR / GRAPH HELPERS (GENERIC /send-email API) -----------------
+def get_app_token():
+    app_msal = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        client_credential=CLIENT_SECRET,
+    )
+
+    token = app_msal.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
+
+    if "access_token" not in token:
+        raise Exception(f"Token Error: {token}")
+
+    return token["access_token"]
+
+
+def graph_post(url, token, payload):
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        raise Exception(response.text)
+
+    return response.json() if response.content else None
+
+
+def send_mail_from_hr(token, to_addr, subject, html_body):
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html_body,
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": to_addr
+                    }
+                }
+            ],
+        },
+        "saveToSentItems": True,
+    }
+
+    graph_post(
+        f"https://graph.microsoft.com/v1.0/users/{HR_UPN}/sendMail",
+        token,
+        payload,
+    )
+
+
 # ---------------- InsightFace Initialization ----------------
 try:
     insight_app = FaceAnalysis(name=INSIGHT_MODEL)
@@ -183,6 +246,10 @@ def process_image():
         user_id = data.get("user_id")
         emp_id = data.get("emp_id")
 
+        # ✅ NEW: get latitude & longitude from frontend payload
+        lat = data.get("latitude")
+        lng = data.get("longitude")
+
         if not captured_data:
             return jsonify({"status": "error", "error": "No captured_image provided"})
 
@@ -221,16 +288,27 @@ def process_image():
                 try:
                     attendance_url = f"https://acsdev.in/fynryx_backend/api/qr/attendance/{emp_id}"
                     now = datetime.now()
+
+                    # ✅ FORCE STRINGS like your sample
+                    latitude_str = str(lat) if lat is not None else ""
+                    longitude_str = str(lng) if lng is not None else ""
+
                     payload = {
                         "user_id": str(user_id or emp_id),
                         "attendance_date": now.strftime("%d-%m-%Y"),
+                        "latitude": latitude_str,
+                        "longitude": longitude_str,
                         "check_in_time": now.strftime("%H:%M"),
                         "check_out_time": "",
                         "status": "present",
                         "create_audit_id": "1",
                     }
+
+                    print("[ATTENDANCE PAYLOAD]", payload)
+
                     res = requests.post(attendance_url, json=payload, timeout=10)
                     attendance_response = res.json()
+                    print("[ATTENDANCE RESPONSE]", attendance_response)
                 except Exception as e:
                     attendance_response = {"error": str(e)}
 
@@ -252,7 +330,7 @@ def process_image():
         return jsonify({"status": "error", "error": str(e)})
 
 
-# ---------------- EMAIL API (FIXED 404 ISSUE) ----------------
+# ---------------- EMAIL API (ATTENDANCE CONFIRMATION) ----------------
 @app.route("/api/send_attendance_email", methods=["POST", "OPTIONS"])
 def api_send_attendance_email():
     if request.method == "OPTIONS":
@@ -290,6 +368,43 @@ def api_send_attendance_email():
     send_email(to_email, subject, html_body)
 
     return jsonify({"status": "success", "message": "Email sent"}), 200
+
+
+# ---------------- GENERIC HR SEND EMAIL API (/send-email) ----------------
+@app.route("/send-email", methods=["POST"])
+def send_email_generic():
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({"error": "Invalid or empty JSON"}), 400
+
+    to_addr = data.get("to")
+    subject = data.get("subject")
+    message = data.get("message")
+
+    if not to_addr or not subject or not message:
+        return jsonify({
+            "error": "Required fields: to, subject, message"
+        }), 400
+
+    try:
+        token = get_app_token()
+
+        send_mail_from_hr(
+            token=token,
+            to_addr=to_addr,
+            subject=subject,
+            html_body=message,
+        )
+
+        return jsonify({
+            "status": "success",
+            "to": to_addr,
+            "subject": subject
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------- BOOT ----------------
