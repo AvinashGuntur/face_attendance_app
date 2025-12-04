@@ -255,6 +255,12 @@ def process_image():
 
         # --- Captured Image ---
         captured_pil = b64_to_pil_image(captured_data)
+
+        # ✅ NEW: convert captured image to PURE base64 JPEG for attendance API
+        img_buf = BytesIO()
+        captured_pil.save(img_buf, format="JPEG", quality=90)
+        captured_b64 = base64.b64encode(img_buf.getvalue()).decode("utf-8")
+
         captured_emb = get_first_normed_embedding_from_pil(captured_pil)
         if captured_emb is None:
             return jsonify({"status": "unknown", "error": "No face found in captured image"})
@@ -301,6 +307,7 @@ def process_image():
                         "check_in_time": now.strftime("%H:%M"),
                         "check_out_time": "",
                         "status": "present",
+                        "image": captured_b64,   # ✅ PURE BASE64 IMAGE SENT TO BACKEND
                         "create_audit_id": "1",
                     }
 
